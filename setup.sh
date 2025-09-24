@@ -1,81 +1,111 @@
 #!/bin/bash
-# This script sets up the complete AI backend environment, including DPO training dependencies.
+# Vessl.ai Service 환경에 최적화된 AI 백엔드 환경 설정 스크립트
+# 최초 1회만 전체 설치를 수행하고, 이후에는 영속성 볼륨을 통해 빠르게 시작합니다.
 set -e
 
-# --- 1. System & Prerequisite Setup ---
-echo ">>> (Step 1/6) Updating package lists and installing prerequisites..."
-apt-get update > /dev/null
-apt-get install -y curl > /dev/null
-pip install -q huggingface_hub[cli]
-echo ">>> Prerequisites are up to date."
+# --- 1. 영속성 볼륨 설정 및 설치 완료 확인 ---
+# Vessl 서비스 설정의 Mount Path와 일치해야 합니다.
+PERSISTENT_DIR="/persistent"
+# 설치 완료 여부를 확인할 플래그 파일 (버전 관리를 위해 v1 추가)
+SETUP_FLAG="${PERSISTENT_DIR}/.setup_complete_v1"
 
-# --- 2. Redis Stack Server Setup ---
-echo ">>> (Step 2/6) Setting up Redis Stack Server..."
-if ! command -v redis-stack-server &> /dev/null;
-then
-    echo "    - Installing Redis..."
+# 영속 볼륨에 모델과 데이터를 저장할 디렉토리 생성
+mkdir -p "${PERSISTENT_DIR}/models/hf"
+mkdir -p "${PERSISTENT_DIR}/models/gguf"
+mkdir -p "${PERSISTENT_DIR}/ollama_models" # Ollama가 모델을 저장할 경로
+
+# 플래그 파일이 존재하면, 무거운 설치 작업을 모두 건너뜁니다.
+if [ -f "${SETUP_FLAG}" ]; then
+    echo "✅ Setup has already been completed. Skipping installation and downloads."
+else
+    echo "🚀 Performing first-time setup... This will take a while."
+    
+    # --- 2. 시스템 및 필수 도구 설치 (최초 1회) ---
+    echo ">>> (Step 1/5) Updating package lists and installing prerequisites..."
+    apt-get update > /dev/null
+    apt-get install -y curl gpg > /dev/null
+    pip install -q huggingface_hub[cli]
+    echo ">>> Prerequisites are up to date."
+
+    # --- 3. Redis Stack 서버 설치 (최초 1회) ---
+    echo ">>> (Step 2/5) Setting up Redis Stack Server..."
     curl -fsSL https://packages.redis.io/gpg | gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
     echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/redis.list > /dev/null
     apt-get update > /dev/null
     apt-get install -y redis-stack-server > /dev/null
+    echo ">>> Redis installed."
+    
+    # --- 4. Ollama 설치 및 모든 모델 다운로드 (최초 1회) ---
+    echo ">>> (Step 3/5) Setting up Ollama and downloading all models to persistent storage..."
+    curl -fsSL https://ollama.com/install.sh | sh
+    
+    # Ollama가 모델을 영속 볼륨에 저장하도록 환경 변수 설정
+    export OLLAMA_MODELS="${PERSISTENT_DIR}/ollama_models"
+    
+    # 백그라운드에서 Ollama 임시 실행
+    ollama serve &
+    OLLAMA_PID=$!
+    # Ollama 서버가 시작될 시간을 충분히 줍니다.
+    sleep 10
+    
+    echo "    - Pulling base models: nomic-embed-text, mixtral, llama3:70b..."
+    ollama pull nomic-embed-text > /dev/null
+    ollama pull mixtral > /dev/null
+    ollama pull llama3:70b > /dev/null
+    echo "    - Base models pulled."
+
+    # DPO 기본 모델 다운로드 (영속 볼륨에)
+    DPO_MODEL_PATH="${PERSISTENT_DIR}/models/hf/Llama3-OpenBioLLM-8B"
+    echo "    - Downloading DPO base model to ${DPO_MODEL_PATH}..."
+    huggingface-cli download aaditya/Llama3-OpenBioLLM-8B --local-dir "${DPO_MODEL_PATH}" --local-dir-use-symlinks False
+    echo "    - DPO base model downloaded."
+
+    # 추론용 GGUF 모델 다운로드 (영속 볼륨에)
+    GGUF_MODEL_FILE_PATH="${PERSISTENT_DIR}/models/gguf/llama3-openbiollm-8b.Q4_K_M.gguf"
+    echo "    - Downloading Inference GGUF model to ${GGUF_MODEL_FILE_PATH}..."
+    huggingface-cli download MoMonir/Llama3-OpenBioLLM-8B-GGUF \
+        llama3-openbiollm-8b.Q4_K_M.gguf \
+        --local-dir "${PERSISTENT_DIR}/models/gguf" --local-dir-use-symlinks False
+    echo "    - GGUF model downloaded."
+    
+    # 임시 Ollama 종료
+    kill $OLLAMA_PID
+    sleep 5
+    
+    # --- 5. 설치 완료 플래그 생성 ---
+    echo ">>> (Step 4/5) First-time setup complete. Creating flag file."
+    touch "${SETUP_FLAG}"
 fi
-if ! pgrep -f redis-stack-server > /dev/null;
-then
+
+# --- 6. 서비스 시작 (매번 실행) ---
+echo ">>> (Step 5/5) Starting core services..."
+
+# Redis가 실행 중이 아니면 백그라운드에서 실행
+if ! pgrep -f redis-stack-server > /dev/null; then
     redis-stack-server --daemonize yes
     echo ">>> Redis Stack Server started."
 else
     echo ">>> Redis is already running."
 fi
 
-# --- 3. Ollama and Embedding Model Setup ---
-echo ">>> (Step 3/6) Setting up Ollama and embedding model..."
-if ! command -v ollama &> /dev/null;
-then
-    echo "    - Installing Ollama..."
-    curl -fsSL https://ollama.com/install.sh | sh
-fi
-if ! pgrep -f "ollama serve" > /dev/null;
-then
-    echo "    - Starting Ollama server in background..."
+# Ollama가 실행 중이 아니면 백그라운드에서 실행 (영속 볼륨 경로 사용)
+if ! pgrep -f "ollama serve" > /dev/null; then
+    export OLLAMA_MODELS="${PERSISTENT_DIR}/ollama_models"
     ollama serve &
-    sleep 5 # Give it a moment to initialize
-fi
-
-echo "    - Verifying and pulling 'nomic-embed-text' model..."
-ollama pull nomic-embed-text > /dev/null
-echo ">>> Ollama server and embedding model are ready."
-
-# --- 4. Main LLM Setup (Inference & DPO) ---
-echo ">>> (Step 4/6) Setting up main LLMs for Inference and DPO..."
-
-# DPO Base Model (Hugging Face Transformers format)
-DPO_MODEL_PATH="/models/hf/Llama3-OpenBioLLM-8B"
-echo "    - Checking for DPO base model at ${DPO_MODEL_PATH}..."
-if [ ! -d "${DPO_MODEL_PATH}" ]; then
-    echo "    - DPO base model not found. Downloading from Hugging Face (aaditya/Llama3-OpenBioLLM-8B)..."
-    # Updated: Corrected repo_id from BioMistral to aaditya
-    huggingface-cli download aaditya/Llama3-OpenBioLLM-8B --local-dir "${DPO_MODEL_PATH}" --local-dir-use-symlinks False
-    echo "    - DPO base model downloaded."
+    sleep 5 # 서버 초기화 시간
+    echo ">>> Ollama server started from persistent storage."
 else
-    echo "    - DPO base model already exists."
+    echo ">>> Ollama is already running."
 fi
 
-# Inference Model (Ollama GGUF format)
+# --- 7. 추론 모델 Ollama에 등록 (매번 확인 후 필요시 실행) ---
 INFERENCE_MODEL_NAME="biollama3"
-GGUF_MODEL_FILE_PATH="/models/gguf/llama3-openbiollm-8b.Q4_K_M.gguf" # [수정됨] 정확한 파일명 지정
-echo "    - Checking for Inference model '${INFERENCE_MODEL_NAME}'..."
+GGUF_MODEL_FILE_PATH="${PERSISTENT_DIR}/models/gguf/llama3-openbiollm-8b.Q4_K_M.gguf"
+# 'ollama list'에 모델 이름이 없는 경우에만 새로 생성
 if ! ollama list | grep -q "${INFERENCE_MODEL_NAME}"; then
-    if [ ! -f "${GGUF_MODEL_FILE_PATH}" ]; then
-        echo "    - GGUF model file not found. Downloading from Hugging Face (MoMonir/Llama3-OpenBioLLM-8B-GGUF)..."
-        # [수정됨] mradermacher -> MoMonir, 그리고 다운로드할 파일명 명시
-        huggingface-cli download MoMonir/Llama3-OpenBioLLM-8B-GGUF \
-            llama3-openbiollm-8b.Q4_K_M.gguf \
-            --local-dir /models/gguf --local-dir-use-symlinks False
-    fi
-    
-    echo "    - Creating Modelfile for '${INFERENCE_MODEL_NAME}'..."
-    cat <<'EOF' > /models/Modelfile
-FROM /models/gguf/llama3-openbiollm-8b.Q4_K_M.gguf
+    echo "    - Inference model '${INFERENCE_MODEL_NAME}' not found in Ollama. Registering from GGUF..."
+    cat <<EOF > /tmp/Modelfile
+FROM ${GGUF_MODEL_FILE_PATH}
 TEMPLATE """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 {{ .System }}<|eot_id|><|start_header_id|>user<|end_header_id|>
@@ -85,70 +115,41 @@ TEMPLATE """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 PARAMETER stop "<|eot_id|>"
 PARAMETER stop "<|end_of_text|>"
 EOF
-    
-    echo "    - Creating custom model with Ollama..."
-    ollama create "${INFERENCE_MODEL_NAME}" -f /models/Modelfile
-    echo ">>> Inference LLM '${INFERENCE_MODEL_NAME}' is ready."
+    ollama create "${INFERENCE_MODEL_NAME}" -f /tmp/Modelfile
+    echo ">>> Inference LLM '${INFERENCE_MODEL_NAME}' registered."
 else
     echo ">>> Inference LLM '${INFERENCE_MODEL_NAME}' already exists."
 fi
 
-# --- 4.5. Additional LLM Setup ---
-echo ">>> (Step 4.5/6) Setting up additional LLM models..."
-ADDITIONAL_MODELS=("mixtral" "llama3:70b")
-for model in "${ADDITIONAL_MODELS[@]}"; do
-    if ! ollama list | grep -q "${model}"; then
-        echo "    - Model '${model}' not found. Downloading now..."
-        ollama pull "${model}"
-    else
-        echo "    - Model '${model}' already exists. Skipping download."
-    fi
-done
-echo ">>> Additional LLMs are ready."
+# --- 8. Python 의존성 설치 및 .env 파일 생성 ---
+echo ">>> Setting up backend environment..."
+# Vessl 실행 명령어의 cd 명령어를 고려하여 경로를 고정합니다.
+BACKEND_DIR="/root/labnote-llm-server/labnote-ai-backend"
 
-# --- 5. Environment and Backend Dependencies Setup ---
-echo ">>> (Step 5/6) Setting up .env file and installing backend dependencies..."
-# `labnote-ai-backend` 디렉터리가 존재할 경우에만 들어감
-if [ -d "labnote-ai-backend" ]; then
-    cd labnote-ai-backend
-else
-    # repository 루트에 있을 경우를 대비
-    echo "    - Already in the project root."
-fi
-
-
-# Create .env file
-echo "    - Creating .env file..."
-cat << EOF > .env
+# .env 파일이 없으면 생성
+if [ ! -f "${BACKEND_DIR}/.env" ]; then
+    echo "    - Creating .env file..."
+    cat << EOF > "${BACKEND_DIR}/.env"
 # Backend Server Configuration
 REDIS_URL="redis://localhost:6379/0"
 OLLAMA_BASE_URL="http://127.0.0.1:11434"
 
 # Model Configuration
 EMBEDDING_MODEL="nomic-embed-text"
-LLM_MODEL="${INFERENCE_MODEL_NAME}" # For inference via Ollama
+LLM_MODEL="${INFERENCE_MODEL_NAME}"
 
 # DPO Training Configuration
-BASE_MODEL_PATH="${DPO_MODEL_PATH}" # For DPO training script
+BASE_MODEL_PATH="${PERSISTENT_DIR}/models/hf/Llama3-OpenBioLLM-8B"
 NEW_MODEL_NAME="biollama3-v2-dpo"
+
+# DPO Git Repository Configuration (토큰은 Vessl Secret 사용 권장)
+DPO_TRAINER_REPO_URL="https://github.com/sblabkribb/labnote-dpo-trainer.git"
+DPO_REPO_LOCAL_PATH="${BACKEND_DIR}/labnote-dpo-trainer-data"
+GIT_AUTH_TOKEN="YOUR_GITHUB_TOKEN"
 EOF
+fi
 
-echo "    - Installing Python dependencies from requirements.txt..."
-pip install -r requirements.txt > /dev/null
-echo ">>> Backend dependencies installed and .env file created."
-
-# 시작 스크립트가 루트에서 실행될 경우를 대비해 다시 상위 디렉토리로 이동하지 않음
-
-# --- 6. Final Instructions ---
-echo ">>> (Step 6/6) Setup complete!"
-
-echo "
---- Next Steps ---"
-echo "1. Start the FastAPI Backend Server:"
-echo "   cd labnote-ai-backend"
-echo "   uvicorn main:app --host 0.0.0.0 --port 8000"
-echo "
-2. To run the DPO training pipeline (optional):"
-echo "   cd labnote-ai-backend"
-echo "   python scripts/run_dpo_training.py"
-echo "------------------"
+# 의존성 패키지는 매번 빠르게 확인/설치합니다.
+pip install -r "${BACKEND_DIR}/requirements.txt" > /dev/null
+echo ">>> Python dependencies are up to date."
+echo "--- Setup script finished. The application is ready to start. ---"
